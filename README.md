@@ -153,6 +153,51 @@ docker compose down
 
 ---
 
+## 🔨 빌드 방법
+
+이미지를 새로 빌드하거나 코드 변경 후 반영할 때:
+
+```bash
+docker compose up -d --build
+```
+
+---
+
+## 📋 테스트 계정
+
+별도의 사전 생성된 테스트 계정은 없습니다.
+http://localhost 접속 후 **회원가입**을 통해 계정을 생성하여 사용하십시오.
+
+---
+
+## 📖 API 문서
+
+| 서비스 | 문서 주소 |
+|---|---|
+| FastAPI AI (Swagger UI) | http://localhost:8000/docs |
+| FastAPI AI (ReDoc) | http://localhost:8000/redoc |
+
+---
+
+## 🚢 배포 방법
+
+본 프로젝트는 Docker Compose 기반으로 구성되어 있어 Docker가 설치된 모든 환경에서 동일하게 실행됩니다.
+
+```bash
+# 프로덕션 실행 (백그라운드)
+docker compose up -d
+
+# 로그 확인
+docker compose logs -f
+
+# 전체 종료 및 컨테이너 삭제
+docker compose down
+```
+
+> **외부 공개 배포 시** `CORS_ALLOWED_ORIGINS` 를 실제 도메인으로 변경하십시오.
+
+---
+
 ## ⚙️ 환경변수 설명
 
 | 변수 | 필수 | 설명 |
