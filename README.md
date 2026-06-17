@@ -177,8 +177,8 @@ docker compose down
 
 | 구분 | 링크 |
 |---|---|
-| 시연 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
-| 강동균 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
+| 시연 영상 | [▶ YouTube 링크](https://youtu.be/Gxvgw_I2xRk) |
+| 강동균 발표 영상 | [▶ YouTube 링크](https://www.youtube.com/watch?v=4pIQlegI13A) |
 | 김성원 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
 | 고결 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
 
