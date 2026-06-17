@@ -23,8 +23,15 @@ server/out/
 server/src.zip
 *.jar
 
+# ── IDE ──────────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+
 # ── 기타 ─────────────────────────────────────────────────
 *.txt.txt
 test.html
 응용소프트웨공학과*
 capstone_secret*
+server/테스트용지식.txt
+Dativus_Ai/added_rules.txt
