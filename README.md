@@ -173,6 +173,17 @@ docker compose down
 
 ---
 
+## 🎬 영상
+
+| 구분 | 링크 |
+|---|---|
+| 시연 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
+| 강동균 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
+| 김성원 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
+| 고결 발표 영상 | [▶ YouTube 링크](https://youtube.com/링크를_여기에_입력) |
+
+---
+
 ## 👥 팀 멤버
 
 | 역할 | 이름 | 담당 |
