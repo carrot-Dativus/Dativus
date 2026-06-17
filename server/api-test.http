@@ -1,0 +1,83 @@
+### 1-1. 회원가입 API 테스트
+POST http://localhost:8080/api/v1/users/register
+Content-Type: application/json
+
+{
+  "email": "test2@dativus.com",
+  "password": "password123",
+  "username": "캡스톤지휘관",
+  "workspaceName": "1조 데이터베이스팀"
+}
+
+### 1-2. 로그인 API 테스트
+POST http://localhost:8080/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "test@dativus.com",
+  "password": "password123"
+}
+
+> {%
+    // 로그인 응답을 받으면 access_token을 뽑아서 'my_token'이라는 이름으로 몰래 저장해라!
+    client.global.set("my_token", response.body.access_token);
+%}
+
+### 2-1. FastAPI 보안 검색대 테스트 (성공 케이스)
+GET http://localhost:8000/api/v1/secure-test
+Authorization: Bearer {{my_token}}
+
+### 3-1. FastAPI 파일 업로드 및 벡터화 테스트
+POST http://localhost:8000/internal/ai/embed
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="workspace_id"
+
+fff7c64d-6da9-4bc8-a731-47b0f7e39dae
+--WebAppBoundary
+Content-Disposition: form-data; name="author"
+
+캡스톤지휘관
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="테스트용지식.txt"
+Content-Type: text/plain
+
+< ./테스트용지식.txt
+--WebAppBoundary--
+
+### 4-1. FastAPI 지식 검색(RAG) 테스트
+GET http://127.0.0.1:8000/internal/ai/search?workspace_id=fff7c64d-6da9-4bc8-a731-47b0f7e39dae&query=데이터베이스는 어떤걸 사용해?&top_k=2
+
+### 5-1. 실전 채팅 API 테스트 (보안 + LangGraph 결합)
+POST http://127.0.0.1:8000/api/v1/chat
+Content-Type: application/json
+Authorization: Bearer {{my_token}}
+
+
+{
+  "query": "Dativus 비밀 문서에 따르면 우리 팀의 프론트엔드 에이스가 누구야?"
+}
+
+### 5-2. SSE 스트리밍 채팅 API 테스트 (타자기 효과)
+POST http://127.0.0.1:8000/api/v1/chat/stream
+Content-Type: application/json
+Authorization: Bearer {{my_token}}
+
+{
+  "query": "데이터베이스 정규화가 뭐야?"
+}
+
+### 6. 문서 업로드 (ETL 파이프라인) 테스트
+POST http://127.0.0.1:8000/api/v1/documents/upload
+Authorization: Bearer {{my_token}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="capstone_secret.txt"
+Content-Type: text/plain
+
+[Dativus 팀 1급 비밀 회의록]
+우리 팀의 프론트엔드 최고 에이스는 '홍길동'이고, 백엔드 지휘관은 '장보고'이다.
+이 프로젝트의 최종 목표는 전 세계 1등 협업 툴이 되는 것이다!
+--WebAppBoundary--

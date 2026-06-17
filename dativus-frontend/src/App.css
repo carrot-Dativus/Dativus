@@ -1,0 +1,75 @@
+
+/* 1. 페이지 전체 구조 */
+body {
+    font-family: 'Noto Sans KR', sans-serif;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background-color: #ffffff;
+}
+
+/* 2. 헤더: 좌우 끝으로 퍼지게 설정 */
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 40px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.logo-text { font-size: 20px; font-weight: 700; color: #000; }
+
+.top-nav { display: flex; align-items: center; gap: 15px; }
+.top-nav span { font-size: 14px; color: #707070; cursor: pointer; }
+.btn-top-login { background: #000; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500; }
+
+/* 3. 메인 로그인 영역: 화면 정중앙 배치 */
+.main-content {
+    flex: 1;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+}
+
+.login-container {
+    width: 100%;
+    max-width: 400px;
+}
+
+.login-title { font-size: 34px; font-weight: 700; color: #000; margin-bottom: 40px; }
+
+/* 4. 입력 폼 */
+.input-group { margin-bottom: 12px; }
+.input-group input { 
+    width: 100%; 
+    padding: 16px; 
+    border: 1px solid #c0c0c0; 
+    border-radius: 6px; 
+    box-sizing: border-box; 
+    font-size: 14px;
+}
+
+.btn-submit-login { 
+    width: 100%; 
+    padding: 16px; 
+    background: #000; 
+    color: #fff; 
+    border: none; 
+    border-radius: 6px; 
+    font-weight: 700; 
+    cursor: pointer; 
+    margin-top: 10px; 
+}
+
+.error-message { color: #ff3b3b; font-size: 12px; margin-bottom: 12px; }
+
+.chat-input::placeholder { color: #555; font-weight: 500; }
+
+/* 5. 반응형 조절 */
+@media (max-width: 480px) {
+    .header { padding: 15px 20px; }
+    .login-title { font-size: 28px; }
+}

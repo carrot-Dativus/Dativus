@@ -1,0 +1,759 @@
+﻿import sys
+import os
+sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+from fastapi import BackgroundTasks, UploadFile, File, FastAPI, Depends, HTTPException, status, Form, Request
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import re
+import shutil
+import os
+import asyncio
+import requests
+from jose import JWTError, jwt
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from database.chroma_manager import collection
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+import uuid
+from pydantic import BaseModel
+from typing import Optional
+from ai_core.router import langgraph_app, RECURSION_LIMIT
+from ai_core.nodes import pop_pending_logs
+from ai_core import tracer as _tracer
+from database.graph_store import ensure_constraints as _graph_ensure, save_triples as graph_save_triples
+from ai_core.llms import local_llm as _local_llm
+_graph_ensure()
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import time
+from langchain_groq import ChatGroq
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Dativus AI Core API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+SPRING_BASE_URL = os.getenv("SPRING_BASE_URL", "http://127.0.0.1:8080")
+
+class ChatRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    history: Optional[list] = []
+    force_agent: Optional[str] = None          # 빌트인 강제 라우팅 (general_agent / expert_agent / coding_math_agent)
+    target_agent_name: Optional[str] = None    # 커스텀 에이전트 이름 (수동 선택)
+    target_agent_prompt: Optional[str] = None  # 커스텀 에이전트 성격/역할 (수동 선택)
+    target_agent_type: Optional[str] = None    # 커스텀 에이전트 엔진 (LOCAL / EXTERNAL_API)
+    custom_agents_list: Optional[list] = []    # 자동 매칭용 전체 커스텀 에이전트 목록
+    existing_dashboard: Optional[dict] = None
+    # Phase 1 개인화: 드롭다운 3개 + 자유 입력 메모
+    persona_expertise: Optional[str] = ""       # 전문 분야
+    persona_tone: Optional[str] = ""            # 대화 어조
+    persona_decision_style: Optional[str] = ""  # 판단 스타일
+    persona_memo: Optional[str] = ""            # 추가 자유 입력 지시문
+
+
+load_dotenv()
+
+print("임베딩 모델(BAAI/bge-m3) 로딩 중...", flush=True)
+model = SentenceTransformer('BAAI/bge-m3')
+print("모델 로딩 완료!", flush=True)
+
+security = HTTPBearer()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM")
+
+if not JWT_SECRET_KEY or not JWT_ALGORITHM:
+    raise RuntimeError("JWT_SECRET_KEY, JWT_ALGORITHM 환경변수가 설정되지 않았습니다. .env 파일을 확인하세요.")
+
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
+        )
+        if "user_id" not in payload:
+            raise HTTPException(status_code=401, detail="토큰에 유저 식별 정보(user_id)가 없습니다.")
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="유효하지 않은 토큰입니다."
+        )
+
+
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"error": "서버 내부 오류가 발생했습니다."})
+
+
+@app.get("/")
+def read_root():
+    return {"message": "Dativus AI Core (FastAPI)가 정상 작동 중입니다! (Port 8000)"}
+
+
+@app.post("/api/v1/chat")
+@limiter.limit("20/minute")
+async def chat_with_ai(
+        request: Request,
+        body: ChatRequest,
+        token_payload: dict = Depends(verify_token)
+):
+    user_id = token_payload.get("user_id")
+    workspace_id = token_payload.get("workspace_id")
+    start_time = time.time()
+
+    inputs = {
+        "query": body.query,
+        "workspace_id": workspace_id,
+        "user_id": user_id
+    }
+    result = await asyncio.to_thread(langgraph_app.invoke, inputs, {"recursion_limit": RECURSION_LIMIT})
+
+    latency = round(time.time() - start_time, 2)
+    final_answer = result.get("final_answer", "")
+    estimated_tokens = int((len(body.query) + len(final_answer)) * 0.8)
+
+    print(f"⏱️ [운영 로그] 일반 동기식 답변 생성 완료.")
+    print(f"   ➔ 소요 시간: {latency}초 | 소모 토큰 추정: {estimated_tokens} Tokens")
+    print(f"==================================================================")
+
+    return {
+        "status": "success",
+        "query": body.query,
+        "answer": final_answer,
+        "latency": latency,
+        "tokens": estimated_tokens
+    }
+
+
+def _send_webhook(url: str, document_id: str, status: str, bearer_token: str = ""):
+    """Spring 웹훅 호출 — Bearer 토큰 포함으로 403 방지."""
+    try:
+        headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+        resp = requests.post(url, json={"documentId": document_id, "status": status}, headers=headers, timeout=10)
+        print(f"[웹훅] {status} 전송 → HTTP {resp.status_code} | documentId={document_id}")
+    except Exception as e:
+        print(f"[웹훅 실패] {e}")
+
+
+def _clean_final_answer(text: str) -> str:
+    """스트리밍 직전 — 알려진 프롬프트 오염 패턴을 제거."""
+    text = re.sub(r'\[사용자 질문[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[이전 대화[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[전 요원[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'\[출력 구조[^\]]*\][^\n]*\n?', '', text)
+    text = re.sub(r'^\[대화 요원[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\[전문가 요원[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    # 개인화 스타일 블록 헤더 누출 제거 - LLM이 프롬프트 지시문을 출력하는 경우
+    text = re.sub(r'^\[사용자 스타일 설정[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\[스타일 참고[^\]]*\][^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^※\s*A/B/C[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^※\s*위 스타일[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\u26a0\ufe0f[^\n]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # llama 모델이 표 셀에 중국어(CJK)를 출력하는 버그 후처리 — 한국어 전용 서비스이므로 제거
+    text = re.sub(r'[一-鿿㐀-䶿豈-﫿]+', '', text)
+    return text.strip()
+
+async def _stream_answer(text: str):
+    """코드 블록은 통째로, 일반 텍스트는 단어 단위로 스트리밍."""
+    # ``` 기준으로 코드 블록과 일반 텍스트 분리
+    segments = re.split(r'(```[\s\S]*?```)', text)
+    for seg in segments:
+        if seg.startswith('```'):
+            # 코드 블록 — 각 줄을 data: 필드로, 하나의 SSE 이벤트로 전송
+            # 프론트 파서가 data: 필드들을 \n으로 합쳐서 코드 블록 원형 복원
+            for line in seg.split('\n'):
+                yield f"data: {line}\n"
+            yield "\n"  # SSE 이벤트 종료
+            await asyncio.sleep(0.005)
+        else:
+            # 일반 텍스트 — 단어 단위 스트리밍
+            for part in re.split(r'(\n)', seg):
+                if part == '\n':
+                    yield "data: \n\n"
+                    await asyncio.sleep(0.003)
+                elif part:
+                    words = part.split(' ')
+                    for i, word in enumerate(words):
+                        token = word if i == len(words) - 1 else word + ' '
+                        if token:
+                            yield f"data: {token}\n\n"
+                            await asyncio.sleep(0.008)
+
+
+async def save_message_to_backend(session_id: str, user_id: str, sender_type: str,
+                                   sender_name: str, content: str, is_private: bool,
+                                   latency: float, tokens: int, bearer_token: str):
+    if not session_id:
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{SPRING_BASE_URL}/api/v1/chats/messages",
+                json={
+                    "sessionId": session_id,
+                    "userId": user_id,
+                    "senderType": sender_type,
+                    "senderName": sender_name,
+                    "content": content,
+                    "isPrivate": is_private,
+                    "latency": latency,
+                    "tokens": tokens,
+                },
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+    except Exception as e:
+        print(f"[메시지 저장 실패] {e}")
+
+
+@app.post("/api/v1/chat/stream")
+@limiter.limit("20/minute")
+async def chat_with_ai_stream(
+        request: Request,
+        body: ChatRequest,
+        token_payload: dict = Depends(verify_token)
+):
+    user_id = token_payload.get("user_id")
+    workspace_id = body.workspace_id or token_payload.get("workspace_id")
+    bearer_token = request.headers.get("Authorization", "").replace("Bearer ", "")
+
+    async def event_generator():
+        # ── 순수 LLM 모드: LangGraph 파이프라인 완전 스킵 ──
+        if body.force_agent == "pure_llm":
+            from ai_core.nodes import local_llm
+            prompt = (
+                "반드시 한국어로만 답변하세요. 영어나 다른 언어는 절대 사용하지 마세요.\n\n"
+                f"사용자 질문: {body.query}"
+            )
+            try:
+                async for chunk in local_llm.astream(prompt):
+                    text = chunk.content if hasattr(chunk, "content") else str(chunk)
+                    if text:
+                        yield f"data: {text}\n\n"
+            except Exception as e:
+                yield f"data: [LOG]오류: {str(e)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        start_time = time.time()
+        _trace_id = uuid.uuid4().hex[:8]
+        _tracer.start_trace(_trace_id, workspace_id or "", body.query)
+        inputs = {
+            "query": body.query,
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "history": body.history,
+            "force_agent": body.force_agent or "",
+            "custom_agent_name": body.target_agent_name or "",
+            "custom_agent_prompt": body.target_agent_prompt or "",
+            "custom_agent_type": body.target_agent_type or "",
+            "custom_agents_list": body.custom_agents_list or [],
+            "existing_dashboard": body.existing_dashboard or {},
+            "persona_expertise": body.persona_expertise or "",
+            "persona_tone": body.persona_tone or "",
+            "persona_decision_style": body.persona_decision_style or "",
+            "persona_memo": body.persona_memo or "",
+            "_trace_id": _trace_id,
+        }
+
+        node_kor_name = {
+            "supervisor":           "최고 관리자",
+            "clarify":              "역질문 처리",
+            "conversation_memory":  "대화 기억병",
+            "general_agent":        "일반 대화병",
+            "code_search":          "레퍼런스 검색병",
+            "coding_math_agent":    "코딩/수학 전문병",
+            # Phase 1 검색 인텔리전스 노드
+            "query_rewriter":       "쿼리 재작성",
+            "selective_search":     "선택적 검색",
+            "search_grader":        "검색 품질 평가",
+            "expert_agent_react":   "전문 추론병(ReAct)",
+            "expert_tools":         "도구 실행",
+            # 공통 후처리
+            "dashboard_select":     "대시보드 분석",
+            "summary":              "문서 요약병",
+            "critic":               "품질 검수 요원",
+            "revision_agent":       "재작성 요원",
+            "custom_agent_gate":    "커스텀 에이전트",
+            "persona_agent":        "개인화 적용 중",
+        }
+
+        queue = asyncio.Queue()
+        current_multi_agent_responses = []
+
+        async def run_langgraph():
+            try:
+                async for event in langgraph_app.astream(inputs, config={"recursion_limit": RECURSION_LIMIT}):
+                    await queue.put(("event", event))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                await queue.put(("error", str(e)))
+            except BaseException as e:
+                import traceback
+                print("\n🚨🚨🚨 [통신 단절 / 강제 종료 감지] 🚨🚨🚨")
+                print(f"범인(에러)의 정체: {type(e).__name__}")
+                traceback.print_exc()
+
+                if type(e).__name__ != "CancelledError":
+                    await queue.put(("error", f"💣 시스템 에러 발생: {str(e)}"))
+
+                raise e
+            finally:
+                await queue.put(("done", None))
+
+        task = asyncio.create_task(run_langgraph())
+        current_final_answer = ""
+        current_dashboard_data = {}
+        _node_event_time = time.time()
+
+        try:
+            while True:
+                try:
+                    msg_type, data = await asyncio.wait_for(queue.get(), timeout=3.0)
+
+                    if msg_type == "done":
+                        break
+                    elif msg_type == "error":
+                        _tracer.record_error(_trace_id, data)
+                        yield f"data: [LOG]{data}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+                    elif msg_type == "event":
+                        event = data
+                        for node_name, output in event.items():
+                            is_dict = isinstance(output, dict) if output is not None else False
+
+                            # ── 트레이서: 노드 타이밍 기록 ──────────────────────
+                            _now = time.time()
+                            _node_ms = round((_now - _node_event_time) * 1000)
+                            _tracer.record_node_timing(_trace_id, node_name, _node_ms)
+                            _node_event_time = _now
+                            # ────────────────────────────────────────────────────
+
+                            if is_dict and "final_answer" in output:
+                                current_final_answer = output["final_answer"]
+
+                            # dashboard_select 노드에서 대시보드 데이터 캡처
+                            if node_name == "dashboard_select" and is_dict:
+                                d = output.get("dashboard_data")
+                                if d and isinstance(d, dict) and d.get("charts"):
+                                    current_dashboard_data = d
+
+                            agent_name = node_kor_name.get(node_name, node_name)
+
+                            if node_name == "supervisor" and is_dict:
+                                target = output.get("target_agent_name", "")
+                                if target in ("general_agent", "expert_agent", "coding_math_agent"):
+                                    yield f"data: [ROUTE]{target}\n\n"
+                                    _tracer.record_routing(_trace_id, target)
+                                yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+                            elif node_name == "clarify" and is_dict and output.get("need_clarification"):
+                                # 역질문 이벤트 즉시 전송
+                                import json as _json
+                                payload = {
+                                    "question": output.get("clarify_question", ""),
+                                    "options": output.get("clarify_options", []),
+                                    "multi_select": output.get("clarify_multi_select", False),
+                                }
+                                yield f"data: [CLARIFY]{_json.dumps(payload, ensure_ascii=False)}\n\n"
+                                await asyncio.sleep(0.01)
+                            elif node_name == "critic":
+                                critic_result = output.get("critic_feedback") if is_dict else None
+                                critic_passed = False
+                                if critic_result:
+                                    try:
+                                        import json as _json
+                                        fb = _json.loads(critic_result)
+                                        critic_passed = bool(fb.get("pass"))
+                                        if critic_passed:
+                                            yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과! 완벽한 답변입니다.\n\n"
+                                        else:
+                                            reasons = ", ".join(fb.get("reasons", []))
+                                            yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려: {reasons}\n\n"
+                                    except Exception:
+                                        # 레거시 문자열 포맷 호환
+                                        critic_passed = "PASS" in str(critic_result).upper()
+                                        if critic_passed:
+                                            yield f"data: [LOG]✅ [품질 검수 요원] 검수 통과!\n\n"
+                                        else:
+                                            yield f"data: [LOG]❌ [품질 검수 요원] 답변 반려\n\n"
+                            elif node_name == "expert_agent_react" and is_dict:
+                                # 도구 호출 이력 트레이서 기록
+                                _tc_history = output.get("tool_calls_history") or []
+                                if _tc_history:
+                                    _tracer.record_tool_calls(
+                                        _trace_id,
+                                        [e["tool"] for e in _tc_history if isinstance(e, dict) and "tool" in e],
+                                    )
+                                yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+                            elif node_name == "selective_search" and is_dict:
+                                hit = output.get("graph_hit_nodes") or []
+                                if hit:
+                                    yield f"data: [GRAPH_HIT]{','.join(str(h) for h in hit)}\n\n"
+                                yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+                            elif node_name == "custom_agent_gate" and is_dict:
+                                multi = output.get("multi_agent_responses", [])
+                                if multi:
+                                    current_multi_agent_responses.extend(multi)
+                                    names = ", ".join(a["name"] for a in multi)
+                                    yield f"data: [LOG]🎭 다중 에이전트 활성화: {names}\n\n"
+                                matched = output.get("matched_custom_agent_name", "")
+                                if matched:
+                                    yield f"data: [LOG]🎭 [{matched}] 관점 추가 완료.\n\n"
+                            else:
+                                yield f"data: [LOG]🟢 [{agent_name}] 작전 수행 완료.\n\n"
+
+                            await asyncio.sleep(0.01)
+
+                            # 폴백 발생 시 SSE 로그 방출 (접두사에 따라 이벤트 타입 분기)
+                            for pending_log in pop_pending_logs():
+                                if pending_log.startswith('[WARN]'):
+                                    yield f"data: [WARN]{pending_log[6:]}\n\n"
+                                elif pending_log.startswith('[GRAPH_PENDING]'):
+                                    yield f"data: [GRAPH_PENDING]{pending_log[15:]}\n\n"
+                                else:
+                                    yield f"data: [LOG]{pending_log}\n\n"
+
+                            # critic 통과 시 답변 스트리밍 — JSON 형식 파싱
+                            critic_result = output.get("critic_feedback") if is_dict else None
+                            _critic_passed = False
+                            if critic_result:
+                                try:
+                                    import json as _json
+                                    _critic_passed = bool(_json.loads(critic_result).get("pass"))
+                                except Exception:
+                                    _critic_passed = "PASS" in str(critic_result).upper()
+                            if node_name == "critic" and _critic_passed:
+                                # 대시보드 데이터가 있으면 텍스트보다 먼저 전송
+                                if current_dashboard_data:
+                                    import json as _json
+                                    yield f"data: [DASHBOARD]{_json.dumps(current_dashboard_data, ensure_ascii=False)}\n\n"
+                                    await asyncio.sleep(0.01)
+                                # 스트리밍 전 경량 오염 클린업
+                                answer_to_stream = _clean_final_answer(current_final_answer)
+                                async for chunk in _stream_answer(answer_to_stream):
+                                    yield chunk
+                                # 다중 에이전트 응답 — 각각 별도 버블로 순차 스트리밍
+                                for agent_resp in current_multi_agent_responses:
+                                    await asyncio.sleep(0.1)
+                                    yield f"data: [AGENT_START:{agent_resp['name']}]\n\n"
+                                    await asyncio.sleep(0.05)
+                                    async for chunk in _stream_answer(_clean_final_answer(agent_resp["response"])):
+                                        yield chunk
+                                    yield f"data: [AGENT_END]\n\n"
+                                    await asyncio.sleep(0.05)
+                            elif node_name == "greeting" and is_dict and "final_answer" in output:
+                                answer_to_stream = _clean_final_answer(current_final_answer)
+                                async for chunk in _stream_answer(answer_to_stream):
+                                    yield chunk
+
+                except asyncio.TimeoutError:
+                    yield ": keep-alive ping\n\n"
+
+        finally:
+            task.cancel()
+            # 클라이언트 disconnect(GeneratorExit) 포함 모든 경우에 트레이스 보장 저장
+            _tracer.finish_and_save(
+                _trace_id,
+                total_ms=round((time.time() - start_time) * 1000),
+                final_answer=current_final_answer,
+            )
+
+        latency = round(time.time() - start_time, 2)
+        estimated_tokens = int((len(body.query) + len(current_final_answer)) * 0.8)
+
+        yield f"data: [LOG]소요 시간: {latency}초 | 소모 토큰: {estimated_tokens}\n\n"
+        await asyncio.sleep(0.05)
+        yield f"data: [LOG]모든 에이전트 응답 완료.\n\n"
+
+        # 메시지 저장은 프론트엔드(useChatSession.js)에서 단일 처리 — 여기서 중복 저장하면 재로그인 시 답변 2개 발생
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/v1/documents/upload")
+async def upload_document(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        document_id: str = Form(...),
+        file: UploadFile = File(...),
+        token_payload: dict = Depends(verify_token)
+):
+    workspace_id = token_payload.get("workspace_id")
+    # 업로드 요청의 Bearer 토큰을 백그라운드 태스크에 전달 → 웹훅 인증에 사용
+    bearer_token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    UPLOAD_DIR = "temp_uploads"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    background_tasks.add_task(process_and_store_document, file_path, file.filename, workspace_id, document_id, bearer_token)
+
+    return {
+        "status": "success",
+        "message": f"'{file.filename}' 파일 접수 완료! 백그라운드에서 AI 분석을 시작합니다."
+    }
+
+
+def process_and_store_document(file_path: str, filename: str, workspace_id: str, document_id: str, bearer_token: str = ""):
+    try:
+        if filename.endswith(".pdf"):
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+        elif filename.endswith(".txt"):
+            loader = TextLoader(file_path, encoding="utf-8")
+            documents = loader.load()
+        else:
+            return
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = text_splitter.split_documents(documents)
+
+        ids = []
+        embeddings = []
+        metadatas = []
+        documents_text = []
+
+        for i, chunk in enumerate(chunks):
+            chunk_id = str(uuid.uuid4())
+            text = chunk.page_content
+            ids.append(chunk_id)
+            documents_text.append(text)
+            embeddings.append(model.encode(text).tolist())
+            metadatas.append({
+                "workspace_id": workspace_id,
+                "file_name": filename,
+                "chunk_index": i
+            })
+
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents_text
+        )
+
+        # ③ 문서에서 지식 그래프 추출 → Groq JSON mode → Neo4j 저장
+        if workspace_id and documents_text:
+            # 청크 앞 3개를 history 자리에 넣어 TRIPLE_EXTRACTION_PROMPT 재사용
+            sample = "\n".join(documents_text[:3])[:2000]
+            try:
+                triples_text = _graph_extract_triples(sample, f"문서 '{filename}' 핵심 개체·관계 추출", max_chars=1800)
+                if triples_text:
+                    saved = graph_save_triples(workspace_id, triples_text)
+                    print(f"🕸️ [GraphRAG] 문서 '{filename}' → {saved}개 트리플 저장 (Groq JSON mode)")
+                    # 문서 추가 후 엔티티/관계 중복 병합
+                    merged_e = _merge_similar(workspace_id, model)
+                    merged_p = _merge_predicates(workspace_id, model)
+                    if merged_e or merged_p:
+                        print(f"🕸️ [GraphRAG] 문서 후처리 병합 — 엔티티 {merged_e}쌍, 관계 {merged_p}쌍")
+                else:
+                    print(f"🕸️ [GraphRAG] 문서 그래프 추출 0건 (Groq 소진 또는 구조 없음)")
+            except Exception as ge:
+                print(f"🕸️ [GraphRAG] 문서 그래프 추출 실패: {ge}")
+
+        _send_webhook(f"{SPRING_BASE_URL}/api/v1/documents/webhook", document_id, "DONE", bearer_token)
+
+    except Exception as e:
+        print(f"[백그라운드] 에러 발생: {e}")
+        _send_webhook(f"{SPRING_BASE_URL}/api/v1/documents/webhook", document_id, "FAILED", bearer_token)
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+@app.delete("/api/v1/documents")
+async def delete_document_vectors(workspace_id: str, file_name: str):
+    try:
+        collection.delete(
+            where={
+                "$and": [
+                    {"workspace_id": workspace_id},
+                    {"file_name": file_name}
+                ]
+            }
+        )
+        print(f"🔥 [망각 완료] 워크스페이스({workspace_id})의 '{file_name}' 기억이 뇌에서 영구 삭제되었습니다.")
+        return {"status": "success", "message": "기억 삭제 완료"}
+    except Exception as e:
+        print(f"🚨 [망각 실패] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --------------------------------------------------------------------------
+# 프롬프트 자동 최적화
+# --------------------------------------------------------------------------
+class FailedLogItem(BaseModel):
+    query: str
+    answer: str
+
+
+class OptimizeRequest(BaseModel):
+    logs: list[FailedLogItem]
+
+
+@app.post("/api/v1/prompts/optimize")
+async def optimize_system_prompt(request: OptimizeRequest):
+    print("🧠 [Auto-Optimizer] 오답 노트 분석 및 프롬프트 자가 진화 시작...")
+
+    optimizer_llm = ChatGroq(temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.1-8b-instant")
+
+    log_text = ""
+    for i, log in enumerate(request.logs):
+        log_text += f"[{i + 1}번 실패 사례]\n- 사유: {log.query}\n- 답변: {log.answer}\n\n"
+
+    prompt = f"""당신은 Dativus 시스템의 프롬프트 최적화 수석 엔지니어입니다.
+    아래의 오답 노트를 보고, AI가 앞으로 절대 같은 실수를 하지 않도록 방어하는 [새로운 추가 규칙 1줄]을 작성하세요.
+
+    [오답 노트 기록]
+    {log_text}
+
+    반드시 문장 앞에 '-' 기호를 붙여 핵심 추가 규칙 딱 1줄만 출력하세요.
+    예시: - 데이터베이스 관련 기술 요약 브리핑 시 '진격'과 같은 가벼운 군대식 페르소나 단어 사용을 엄격히 금지할 것."""
+
+    new_rule = optimizer_llm.invoke(prompt).content.strip()
+
+    with open("added_rules.txt", "a", encoding="utf-8") as f:
+        f.write(f"{new_rule}\n")
+
+    print(f"✨ [진화 완료] 시스템 신규 누적 규칙 각인: {new_rule}")
+    return {"status": "success", "new_rule": new_rule}
+
+
+# --------------------------------------------------------------------------
+# GraphRAG pending 큐 수동 처리
+# --------------------------------------------------------------------------
+from database.graph_store import load_pending as _load_pending, clear_pending as _clear_pending, save_triples as _save_triples, get_triples_raw as _get_triples_raw, merge_similar_entities as _merge_similar, merge_similar_predicates as _merge_predicates, normalize_existing_predicates as _normalize_predicates
+from ai_core.nodes import _extract_triples as _graph_extract_triples
+
+@app.post("/api/v1/graph/flush-pending")
+async def flush_pending_graph(token_payload: dict = Depends(verify_token)):
+    """사용자 확인 후 pending 그래프 큐를 일괄 처리."""
+    workspace_id = token_payload.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id 없음")
+
+    def _do_flush():
+        pending = _load_pending(workspace_id)
+        if not pending:
+            return 0, 0
+        flushed_triples = 0
+        flushed_items = 0
+        for item in pending:
+            triples = _graph_extract_triples(item["history"], item["query"])
+            if triples:
+                flushed_triples += _save_triples(workspace_id, triples)
+                flushed_items += 1
+            else:
+                break  # Groq 한도 소진 → 중단
+        if flushed_items:
+            _clear_pending(workspace_id)
+        return flushed_items, flushed_triples
+
+    items, triples = await asyncio.to_thread(_do_flush)
+    # flush 후: regex 소급 정규화 → 시맨틱 관계 병합 → 시맨틱 엔티티 병합
+    pred_normalized = await asyncio.to_thread(_normalize_predicates, workspace_id)
+    merged_p = await asyncio.to_thread(_merge_predicates, workspace_id, model)
+    merged_e = await asyncio.to_thread(_merge_similar, workspace_id, model)
+    print(f"🕸️ [GraphRAG] flush-pending: {items}건 처리 → {triples}개 트리플, 관계정규화 {pred_normalized}개, 관계병합 {merged_p}쌍, 엔티티병합 {merged_e}쌍")
+    return {"status": "success", "processed_items": items, "saved_triples": triples, "predicates_normalized": pred_normalized, "predicates_merged": merged_p}
+
+
+@app.get("/api/v1/graph/data")
+async def get_graph_data(token_payload: dict = Depends(verify_token)):
+    """워크스페이스 지식 그래프 데이터를 nodes/edges 형태로 반환 (시각화용)."""
+    workspace_id = token_payload.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id 없음")
+
+    rows = await asyncio.to_thread(_get_triples_raw, workspace_id, 60)
+
+    node_map = {}
+    edges = []
+    for row in rows:
+        a, rel, b = row["a"], row["rel"], row["b"]
+        if a not in node_map:
+            node_map[a] = {"id": a, "name": a}
+        if b not in node_map:
+            node_map[b] = {"id": b, "name": b}
+        edges.append({"source": a, "target": b, "label": rel})
+
+    return {"nodes": list(node_map.values()), "edges": edges}
+
+
+class InjectRequest(BaseModel):
+    triples: str   # "[A] → (관계) → [B]" 형식, 줄바꿈 구분
+
+@app.post("/api/v1/graph/inject")
+async def inject_graph_triples(
+    body: InjectRequest,
+    token_payload: dict = Depends(verify_token),
+):
+    """테스트용: 트리플 직접 주입 — Groq 없이 그래프 기능 전체 테스트 가능."""
+    workspace_id = token_payload.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id 없음")
+    saved = await asyncio.to_thread(graph_save_triples, workspace_id, body.triples)
+    return {"saved": saved, "workspace_id": workspace_id}
+
+
+@app.delete("/api/v1/graph/clear")
+async def clear_graph(token_payload: dict = Depends(verify_token)):
+    """테스트용: 워크스페이스 그래프 전체 삭제."""
+    workspace_id = token_payload.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id 없음")
+    from database.graph_store import _get_driver, _invalidate_cache
+    def _clear():
+        with _get_driver().session() as session:
+            result = session.run(
+                "MATCH (n:Entity {workspace_id: $ws}) DETACH DELETE n RETURN count(n) AS deleted",
+                ws=workspace_id,
+            )
+            return result.single()["deleted"]
+    deleted = await asyncio.to_thread(_clear)
+    _invalidate_cache(workspace_id)
+    return {"deleted_nodes": deleted}
+
+
+# ==========================================
+# 🔭 Phase 2 Item 10 — 트레이스 조회 API
+# ==========================================
+@app.get("/api/v1/traces")
+async def get_traces(n: int = 50, token_payload: dict = Depends(verify_token)):
+    """최근 N개 요청 트레이스 반환 (노드 타이밍, 라우팅, 도구 호출 포함)."""
+    records = await asyncio.to_thread(_tracer.load_recent_traces, n)
+    return {"count": len(records), "traces": records}
